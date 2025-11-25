@@ -1,0 +1,556 @@
+'use strict'
+
+require('dotenv').config()
+
+const { Bot, InputFile } = require('grammy')
+const fs = require('node:fs')
+const fsp = require('node:fs/promises')
+const core = require('keson-spectral-improver-core')
+const messages = require('./messages')
+const {
+  ACCESS_PASSWORDS,
+  ADMIN_USER_IDS,
+  BOT_TOKEN,
+  MAX_AUTHORIZED_USERS,
+  MAX_CONCURRENT_DOWNLOADS,
+  MAX_PENDING_DOWNLOADS,
+  PASSWORD_SEGMENT_SIZE,
+  SHUTDOWN_SIGNALS,
+  TELEGRAM_MAX_FILE_BYTES,
+  validateRequiredEnv
+} = require('./config')
+const {
+  buildCaption,
+  analyzeTrackQuality,
+  qualityDebug,
+  createTaskQueue,
+  isIdhsSupportedLink,
+  resolveLinkViaIdhs
+} = core
+const { downloadTrack, cleanupTempDir, fetchPlaylistTracks } = core
+const {
+  extractFirstUrl,
+  extractSoundCloudUrl,
+  formatUserFacingError,
+  isBotCommand,
+  isSoundCloudPlaylist
+} = core.utils
+const {
+  addAuthorizedUser,
+  authorizedUsers,
+  flushState,
+  getDownloadCount,
+  incrementDownloadCount,
+  isAuthorized,
+  loadAuthorizedUsersFromDisk,
+  loadDownloadCountFromDisk
+} = require('./auth-store')
+
+validateRequiredEnv()
+
+const bot = new Bot(BOT_TOKEN)
+const awaitingPassword = new Set()
+const downloadQueue = createTaskQueue(MAX_CONCURRENT_DOWNLOADS, MAX_PENDING_DOWNLOADS)
+let isShuttingDown = false
+const playlistSessions = new Map()
+const adminUserIds = new Set(ADMIN_USER_IDS)
+const PLAYLIST_CHUNK_SIZE = 10
+const PLAYLIST_MAX_ITEMS = 100
+const PLAYLIST_GROUP_SIZE = 10
+
+function isAuthCapacityReached() {
+  return ACCESS_PASSWORDS.length === 0 || authorizedUsers.size >= MAX_AUTHORIZED_USERS
+}
+
+function passwordForNextUser() {
+  const segmentIndex = Math.floor(authorizedUsers.size / PASSWORD_SEGMENT_SIZE)
+  return ACCESS_PASSWORDS[segmentIndex]
+}
+
+function isAdmin(userId) {
+  return typeof userId === 'number' && adminUserIds.has(userId)
+}
+
+async function notifyAdmins(message) {
+  if (!adminUserIds.size) return
+  const sends = []
+  adminUserIds.forEach(id => {
+    sends.push(
+      bot.api
+        .sendMessage(id, message)
+        .catch(error => console.warn('Failed to notify admin', id, error?.message || error))
+    )
+  })
+  await Promise.allSettled(sends)
+}
+
+function shouldNotifyAdmin(error) {
+  if (!error) return true
+  if (error.userMessage) return false // user-facing issues we already message
+  if (error.code === 'QUEUE_FULL') return false
+  return true
+}
+
+setupSignalHandlers()
+setupErrorHandlers()
+
+bot.api
+  .setMyCommands([{ command: 'start', description: 'Show bot instructions' }])
+  .catch(error => console.warn('Unable to set bot commands:', error))
+
+bot.command('start', async ctx => {
+  await ctx.reply(messages.startIntro())
+
+  const userId = ctx.from?.id
+  if (!userId) {
+    await ctx.reply(messages.userIdMissing())
+    return
+  }
+
+  if (isAuthorized(userId)) {
+    await ctx.reply(messages.alreadyAuthorized())
+  } else {
+    await promptForPassword(ctx, userId)
+  }
+})
+
+bot.command('downloads', async ctx => {
+  await ctx.reply(messages.downloadCount(getDownloadCount()))
+})
+
+bot.command('userid', async ctx => {
+  const userId = ctx.from?.id
+  if (!userId) {
+    await ctx.reply(messages.userIdMissing())
+    return
+  }
+
+  console.log(`User ID request: ${userId} (username=${ctx.from?.username || 'n/a'})`)
+  await ctx.reply(messages.userIdResponse(userId))
+})
+
+bot.command('broadcast', async ctx => {
+  const userId = ctx.from?.id
+  if (!userId) {
+    await ctx.reply(messages.userIdMissing())
+    return
+  }
+
+  if (!isAdmin(userId)) {
+    await ctx.reply(messages.notAdmin())
+    return
+  }
+
+  const rawText = ctx.message?.text || ''
+  const text = rawText.replace(/^\/broadcast(@\w+)?\s*/i, '').trim()
+  if (!text) {
+    await ctx.reply(messages.broadcastUsage())
+    return
+  }
+
+  if (!authorizedUsers.size) {
+    await ctx.reply(messages.broadcastNoUsers())
+    return
+  }
+
+  let sent = 0
+  let failed = 0
+  for (const targetId of authorizedUsers) {
+    try {
+      await bot.api.sendMessage(targetId, text)
+      sent += 1
+    } catch (error) {
+      failed += 1
+      console.warn('Broadcast send failed:', targetId, error?.message || error)
+    }
+  }
+
+  await ctx.reply(messages.broadcastResult(sent, failed))
+})
+
+bot.on('message:text', async ctx => {
+  if (isBotCommand(ctx)) {
+    return
+  }
+
+  const userId = ctx.from?.id
+  if (!userId) {
+    await ctx.reply(messages.userIdMissing())
+    return
+  }
+
+  if (!isAuthorized(userId)) {
+    await handlePasswordFlow(ctx, userId)
+    return
+  }
+
+  const messageText = ctx.message.text || ''
+  let url = extractSoundCloudUrl(messageText)
+
+  if (!url) {
+    const candidate = extractFirstUrl(messageText)
+    if (candidate && isIdhsSupportedLink(candidate)) {
+      await ctx.reply(messages.conversionInProgress())
+      try {
+        url = await resolveLinkViaIdhs(candidate)
+      } catch (error) {
+        console.error('IDHS resolve failed:', error)
+        if (shouldNotifyAdmin(error)) {
+          notifyAdmins(messages.adminErrorNotice(describeError(error))).catch(() => {})
+        }
+        await ctx.reply(messages.genericError())
+        return
+      }
+      if (!url) {
+        await ctx.reply(messages.conversionNotFound())
+        return
+      }
+    }
+  }
+
+  if (!url) {
+    await ctx.reply(messages.invalidSoundCloudLink())
+    return
+  }
+
+  if (isSoundCloudPlaylist(url)) {
+    await handlePlaylistRequest(ctx, url)
+    return
+  }
+
+  await ctx.reply(messages.downloadPrep())
+
+  try {
+    await downloadQueue.add(() => handleDownloadJob(ctx, url))
+  } catch (error) {
+    console.error('Download failed:', error)
+    if (shouldNotifyAdmin(error)) {
+      notifyAdmins(messages.adminErrorNotice(describeError(error))).catch(() => {})
+    }
+    await ctx.reply(formatUserFacingError(error))
+  }
+})
+
+bot.catch(err => {
+  console.error('Bot error:', err)
+  notifyAdmins(messages.adminErrorNotice(describeError(err))).catch(() => {})
+})
+
+bot.on('callback_query:data', async ctx => {
+  const data = ctx.callbackQuery.data || ''
+  if (!data.startsWith('pl:')) return
+  const [, action, sessionId] = data.split(':')
+  const session = playlistSessions.get(sessionId)
+  if (!session) {
+    await ctx.answerCallbackQuery({ text: 'Session expirée', show_alert: false })
+    return
+  }
+  if (ctx.from?.id !== session.userId) {
+    await ctx.answerCallbackQuery({ text: "Ce n'est pas ta playlist ;)", show_alert: true })
+    return
+  }
+
+  if (action === 'stop') {
+    playlistSessions.delete(sessionId)
+    await ctx.answerCallbackQuery({ text: 'Arrêté' })
+    await ctx.editMessageText(messages.playlistStopped())
+    return
+  }
+
+  if (action === 'cont') {
+    session.awaitingPrompt = false
+    playlistSessions.set(sessionId, session)
+    await ctx.answerCallbackQuery({ text: 'On continue' })
+    enqueueNextTrack(ctx, sessionId, true)
+  }
+})
+
+initializeBot().catch(error => {
+  console.error('Failed to start bot:', error)
+  process.exit(1)
+})
+
+async function handlePlaylistRequest(ctx, url) {
+  const entries = await fetchPlaylistTracks(url, PLAYLIST_MAX_ITEMS)
+  if (!entries.length) {
+    await ctx.reply(messages.playlistNoEntries())
+    return
+  }
+  const sessionId = `${ctx.from.id}-${Date.now()}`
+  const session = {
+    id: sessionId,
+    userId: ctx.from.id,
+    tracks: entries,
+    nextIndex: 0,
+    promptMessageId: null,
+    awaitingPrompt: false,
+    buffer: []
+  }
+  playlistSessions.set(sessionId, session)
+  await ctx.reply(messages.playlistDetected(entries.length, PLAYLIST_CHUNK_SIZE, PLAYLIST_MAX_ITEMS))
+  enqueueNextTrack(ctx, sessionId)
+}
+
+async function enqueueNextTrack(ctx, sessionId, force = false) {
+  const session = playlistSessions.get(sessionId)
+  if (!session) return
+
+  if (session.nextIndex >= session.tracks.length) {
+    if (session.buffer.length) {
+      await sendPlaylistGroup(ctx, sessionId)
+    }
+    await ctx.reply(messages.playlistDone())
+    playlistSessions.delete(sessionId)
+    return
+  }
+
+  if (!force && session.nextIndex > 0 && session.nextIndex % PLAYLIST_CHUNK_SIZE === 0) {
+    if (session.awaitingPrompt) return
+    const msg = await ctx.reply(
+      messages.playlistChunkPrompt(session.nextIndex, session.tracks.length, PLAYLIST_CHUNK_SIZE),
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '▶️ Continuer', callback_data: `pl:cont:${sessionId}` },
+              { text: '🛑 Stop', callback_data: `pl:stop:${sessionId}` }
+            ]
+          ]
+        }
+      }
+    )
+    session.promptMessageId = msg.message_id
+    session.awaitingPrompt = true
+    playlistSessions.set(sessionId, session)
+    return
+  }
+
+  const trackUrl = session.tracks[session.nextIndex]
+  session.nextIndex += 1
+  playlistSessions.set(sessionId, session)
+
+  try {
+    await downloadQueue.add(async () => {
+      const result = await handleDownloadJob(ctx, trackUrl, { skipSend: true })
+      if (!result) return
+      session.buffer.push({
+        download: result.download,
+        qualityInfo: result.qualityInfo,
+        size: result.size
+      })
+      await sendPlaylistGroup(ctx, sessionId)
+    })
+    await enqueueNextTrack(ctx, sessionId)
+  } catch (error) {
+    console.error('Playlist track failed:', error)
+    if (shouldNotifyAdmin(error)) {
+      notifyAdmins(messages.adminErrorNotice(describeError(error))).catch(() => {})
+    }
+    await ctx.reply(formatUserFacingError(error))
+    // if queue full, stop playlist
+    if (error?.code === 'QUEUE_FULL') {
+      playlistSessions.delete(sessionId)
+      return
+    }
+    await enqueueNextTrack(ctx, sessionId)
+  }
+}
+
+async function sendPlaylistGroup(ctx, sessionId) {
+  const session = playlistSessions.get(sessionId)
+  if (!session || !session.buffer.length) return
+
+  while (session.buffer.length) {
+    const item = session.buffer.shift()
+    if (!item) break
+    const inputFile = new InputFile(
+      fs.createReadStream(item.download.path),
+      item.download.filename
+    )
+    if (item.download?.rateLimited) {
+      await ctx.reply(messages.premiumRateLimited())
+    }
+    const caption = buildCaption(item.download.metadata, item.qualityInfo)
+    await ctx.replyWithDocument(inputFile, { caption })
+
+    if (item.qualityInfo?.warning) {
+      await ctx.reply(item.qualityInfo.warning)
+    }
+    incrementDownloadCount()
+    await cleanupTempDir(item.download.tempDir)
+  }
+
+  session.buffer = []
+  playlistSessions.set(sessionId, session)
+}
+
+async function handlePasswordFlow(ctx, userId) {
+  if (isAuthCapacityReached()) {
+    awaitingPassword.delete(userId)
+    await ctx.reply(messages.authLimitReached())
+    return
+  }
+
+  const expectedPassword = passwordForNextUser()
+  if (!expectedPassword) {
+    awaitingPassword.delete(userId)
+    await ctx.reply(messages.authLimitReached())
+    return
+  }
+
+  const text = (ctx.message.text || '').trim()
+
+  if (awaitingPassword.has(userId)) {
+    if (!text) {
+      await promptForPassword(ctx, userId)
+      return
+    }
+
+    if (text === expectedPassword) {
+      awaitingPassword.delete(userId)
+      addAuthorizedUser(userId)
+      await ctx.reply(messages.passwordAccepted())
+    } else {
+      await ctx.reply(messages.passwordRejected())
+      awaitingPassword.add(userId)
+    }
+    return
+  }
+
+  await promptForPassword(ctx, userId)
+}
+
+async function promptForPassword(ctx, userId) {
+  if (isAuthCapacityReached()) {
+    awaitingPassword.delete(userId)
+    await ctx.reply(messages.authLimitReached())
+    return
+  }
+
+  awaitingPassword.add(userId)
+  await ctx.reply(messages.promptPassword())
+}
+
+async function handleDownloadJob(ctx, url, opts = {}) {
+  const skipSend = opts.skipSend === true
+  let download
+  try {
+    download = await downloadTrack(url)
+    if (download?.rateLimited && !skipSend) {
+      await ctx.reply(messages.premiumRateLimited())
+    }
+    const stats = await fsp.stat(download.path)
+    if (stats.size > TELEGRAM_MAX_FILE_BYTES) {
+      if (!skipSend) {
+        await ctx.reply(messages.fileTooLarge())
+      }
+      return
+    }
+
+    let qualityInfo = null
+    if (core.config.ENABLE_QUALITY_ANALYSIS) {
+      try {
+        qualityInfo = await analyzeTrackQuality(download.path, download.metadata)
+        if (qualityInfo) {
+          qualityDebug('Bitrate analysis finished:', qualityInfo)
+        } else {
+          qualityDebug('Bitrate analysis returned null; using fallback caption text.')
+        }
+      } catch (error) {
+        console.warn('Bitrate analysis failed:', error)
+        qualityDebug('Bitrate analysis threw error:', error)
+      }
+    } else if (core.config.QUALITY_ANALYSIS_DEBUG) {
+      qualityDebug('Quality analysis disabled via ENABLE_QUALITY_ANALYSIS=false; skipping probe.')
+    }
+
+    if (skipSend) {
+      return { download, qualityInfo, size: stats.size }
+    }
+
+    const inputFile = new InputFile(fs.createReadStream(download.path), download.filename)
+    await ctx.replyWithDocument(inputFile, {
+      caption: buildCaption(download.metadata, qualityInfo)
+    })
+    if (qualityInfo?.warning) {
+      await ctx.reply(qualityInfo.warning)
+    }
+    incrementDownloadCount()
+  } finally {
+    if (download && !skipSend) {
+      await cleanupTempDir(download.tempDir)
+    }
+  }
+}
+
+function setupSignalHandlers() {
+  SHUTDOWN_SIGNALS.forEach(signal => {
+    process.once(signal, () => {
+      if (isShuttingDown) return
+      isShuttingDown = true
+      console.log(`Received ${signal}. Stopping bot...`)
+      shutdownGracefully(signal)
+        .catch(error => {
+          console.error('Shutdown failed:', error)
+          process.exitCode = 1
+        })
+        .finally(() => {
+          process.exit(process.exitCode || 0)
+        })
+    })
+  })
+
+  process.on('beforeExit', () => {
+    flushState().catch(error => {
+      console.error('Failed to flush state before exit:', error)
+    })
+  })
+}
+
+function setupErrorHandlers() {
+  const forward = (label, error) => {
+    console.error(`${label}:`, error)
+    notifyAdmins(messages.adminErrorNotice(describeError(error))).catch(() => {})
+  }
+
+  process.on('unhandledRejection', reason => forward('Unhandled rejection', reason))
+  process.on('uncaughtException', error => forward('Uncaught exception', error))
+}
+
+async function shutdownGracefully(signal) {
+  try {
+    await bot.stop()
+  } catch (error) {
+    console.warn(`Unable to stop bot cleanly after ${signal}:`, error)
+  }
+
+  await flushState()
+}
+
+async function initializeBot() {
+  await loadAuthorizedUsersFromDisk()
+  await loadDownloadCountFromDisk()
+  console.log(`Authorized users loaded: ${authorizedUsers.size}`)
+  console.log(`Tracks downloaded historically: ${getDownloadCount()}`)
+  console.log('Bot is up. Waiting for SoundCloud URLs...')
+  await bot.start()
+}
+
+function describeError(error) {
+  if (!error) return 'Unknown error'
+  if (error instanceof Error) {
+    const stack = error.stack || `${error.name || 'Error'}: ${error.message}`
+    return stack.length > 3500 ? stack.slice(0, 3500) + '...' : stack
+  }
+  let text
+  if (typeof error === 'object') {
+    try {
+      text = JSON.stringify(error, null, 2)
+    } catch (_jsonError) {
+      text = String(error)
+    }
+  } else {
+    text = String(error)
+  }
+  return text.length > 3500 ? text.slice(0, 3500) + '...' : text
+}
