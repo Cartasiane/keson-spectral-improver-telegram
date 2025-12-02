@@ -16,6 +16,6 @@
     "dotenv": "^17.2.3",
     "grammy": "^1.38.3",
     "yt-dlp-exec": "^1.0.2",
-    "keson-spectral-improver-core": "file:../keson-spectral-improver-core"
+    "keson-spectral-improver-core": "^0.1.0"
   }
 }
